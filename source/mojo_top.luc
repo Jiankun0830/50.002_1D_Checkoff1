@@ -1,0 +1,151 @@
+// This file describes a user interface for a 16-bit ALU instance.
+// This includes a self-test circuitry for the ALU.
+// Note that all UI elements are on the Mojo I/O shield.
+// The user interface is as follows:
+//  - input:
+//   - 16-bit data input: dip switches 15-0
+//   - alufn input: dip switches 21-16
+//   - update value of ALU input `a`: left button
+//   - update value of ALU input `b`: right button
+//   - begin self-test: up button
+//  - output:
+//   - ALU result output: LEDs 15-0
+//   - ALU `s`, `v`, `n` outputs: LEDs 18-16
+//   - Failed test case index: LEDs 7-0
+//   - Failed test case alufn: LEDs 13-8
+//   - Self-test result: 7-segment display
+//
+// Note: during self-test, the 16-bit data input is used as a bitwise OR mask
+//   to the ALU output before the output is passed to the self-test driver for verification.
+//   This is to allow manually forcing bits to 1, to simulate failed test cases.
+
+module mojo_top (
+    input clk,              // 50MHz clock
+    input rst_n,            // reset button (active low)
+    output led [8],         // 8 user controllable LEDs
+    input cclk,             // configuration clock, AVR ready when high
+    output spi_miso,        // AVR SPI MISO
+    input spi_ss,           // AVR SPI Slave Select
+    input spi_mosi,         // AVR SPI MOSI
+    input spi_sck,          // AVR SPI Clock
+    output spi_channel [4], // AVR general purpose pins (used by default to select ADC channel)
+    input avr_tx,           // AVR TX (FPGA RX)
+    output avr_rx,          // AVR RX (FPGA TX)
+    input avr_rx_busy,      // AVR RX buffer full
+    output io_led [3][8],   // LEDs on IO Shield
+    output io_seg [8],      // 7-segment LEDs on IO Shield
+    output io_sel [4],      // Digit select on IO Shield
+    input io_button [5],    // 5 buttons on IO Shield
+    input io_dip [3][8]     // DIP switches on IO Shield
+  ) {
+  
+  sig rst;                  // reset signal
+
+  // instantiate the ALU
+  alu16 alu;
+  
+  // ROM containing test cases
+  test_case_rom rom;
+    
+  .clk(clk) {
+    // The reset conditioner is used to synchronize the reset signal to the FPGA
+    // clock. This ensures the entire FPGA comes out of reset at the same time.
+    reset_conditioner reset_cond;
+    
+    // represent button press for the update button for `a`
+    reset_conditioner a_cond(.in(io_button[3]));
+    // represent button press for the update button for `b`
+    reset_conditioner b_cond(.in(io_button[4]));
+    // represent button press for starting self-test
+    reset_conditioner start_cond(.in(io_button[0]));
+
+    .rst(rst) {
+      // registers to hold values of `a` and `b` input to the ALU
+      dff a[16];
+      dff b[16];
+      // self-test driver
+      test_driver driver(#SEL_MAX(53), .start(start_cond.out), .ref_out(rom.ref_out));
+      // 7-segment display quad multiplexer
+      sevseg4 sevseg;
+    }
+    
+  }  
+    
+  always {
+    reset_cond.in = ~rst_n; // input raw inverted reset signal
+    rst = reset_cond.out;   // conditioned reset
+    
+    led = 8h00;             // turn LEDs off
+    spi_miso = bz;          // not using SPI
+    spi_channel = bzzzz;    // not using flags
+    avr_rx = bz;            // not using serial port
+    
+    io_led = 3x{{8h00}};    // turn LEDs off
+    io_seg = 8hff;          // turn segments off
+    io_sel = 4hf;           // select no digits
+    
+    // circuitry for managing the values of `a`
+    case(a_cond.out) {
+      // when update button is pressed, update value to dip switch input
+      1: a.d = c{io_dip[1], io_dip[0]};
+      // usually, keep current value
+      default: a.d = a.q;
+    }
+    // circuitry for managing the values of `b`
+    case(b_cond.out) {
+      // when update button is pressed, update value to dip switch input
+      1: b.d = c{io_dip[1], io_dip[0]};
+      // usually, keep current value
+      default: b.d = b.q;
+    }
+    
+    // ALU inputs
+    case(~driver.done & driver.pass) {
+      1:          // driver is testing, take ALU input from ROM
+        alu.alufn = rom.alufn;
+        alu.a = rom.a;
+        alu.b = rom.b;
+      
+      default:    // driver is not testing, take ALU input from `a` and `b` registers
+        alu.alufn = io_dip[2][5:0];
+        alu.a = a.q;
+        alu.b = b.q;
+    }
+    
+    // ROM `sel` signal wiring
+    // `+ 1` because `driver.sel` is the last tested `sel`, not the currently tested `sel`
+    rom.sel = driver.sel;
+
+    // Output override circuitry for self-test
+    driver.alu_out = alu.alu | c{io_dip[1], io_dip[0]};
+
+    // LED display
+    case(driver.done & ~driver.pass) {
+      1:          // test failed
+        io_led[0] = driver.sel - 1;  // show index of last tested case on LEDs 7-0
+        io_led[1] = rom.alufn;       // show `alufn` of last tested case on LEDs 13-8
+        
+      default:    // test hasn't failed
+        // show ALU output on LEDs 15-0
+        io_led[1] = alu.alu[15:8];
+        io_led[0] = alu.alu[7:0];
+    }
+    // display `z`, `v`, `n` on LEDs 18-16
+    io_led[2][2] = alu.z;
+    io_led[2][1] = alu.v;
+    io_led[2][0] = alu.n;
+    
+    // Display result of the test on 7-segment display
+    case({driver.done, driver.pass}) {
+      {1, 1}:        // test passed, display 'PASS'
+        sevseg.segs_array = {8b01110011, 8b01110111, 8b01101101, 8b01101101};
+      {1, 0}:        // test failed, display 'FAIL'
+        sevseg.segs_array = {8b01110001, 8b01110111, 8b00110000, 8b00111000};
+      default:       // test not completed, display nothing
+        sevseg.segs_array = 4x{{8b0}};
+    }
+    io_seg = ~sevseg.segs;
+    io_sel = ~sevseg.sel;
+    
+  }
+}
